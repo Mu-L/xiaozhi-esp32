@@ -189,6 +189,9 @@ bool WebsocketProtocol::OpenAudioChannel() {
     std::string message = "{";
     message += "\"type\":\"hello\",";
     message += "\"version\": " + std::to_string(version_) + ",";
+#if CONFIG_USE_SERVER_AEC
+    message += "\"features\":{\"aec\":true},";
+#endif
     message += "\"transport\":\"websocket\",";
     message += "\"audio_params\":{";
     message += "\"format\":\"opus\", \"sample_rate\":16000, \"channels\":1, \"frame_duration\":" + std::to_string(OPUS_FRAME_DURATION_MS);
@@ -217,6 +220,12 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
         ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
         return;
+    }
+
+    auto session_id = cJSON_GetObjectItem(root, "session_id");
+    if (session_id != nullptr) {
+        session_id_ = session_id->valuestring;
+        ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
 
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");

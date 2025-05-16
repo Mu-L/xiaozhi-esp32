@@ -375,11 +375,19 @@ void Application::Start() {
     }
     codec->Start();
 
+#if CONFIG_USE_AUDIO_PROCESSOR
     xTaskCreatePinnedToCore([](void* arg) {
         Application* app = (Application*)arg;
         app->AudioLoop();
         vTaskDelete(NULL);
-    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_, realtime_chat_enabled_ ? 1 : 0);
+    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_, 1);
+#else
+    xTaskCreate([](void* arg) {
+        Application* app = (Application*)arg;
+        app->AudioLoop();
+        vTaskDelete(NULL);
+    }, "audio_loop", 4096 * 2, this, 8, &audio_loop_task_handle_);
+#endif
 
     /* Wait for the network to be ready */
     board.StartNetwork();
@@ -514,7 +522,7 @@ void Application::Start() {
     });
     bool protocol_started = protocol_->Start();
 
-    audio_processor_->Initialize(codec, realtime_chat_enabled_);
+    audio_processor_->Initialize(codec);
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
         background_task_->Schedule([this, data = std::move(data)]() mutable {
             if (protocol_->IsAudioChannelBusy()) {
@@ -523,10 +531,25 @@ void Application::Start() {
             opus_encoder_->Encode(std::move(data), [this](std::vector<uint8_t>&& opus) {
                 AudioStreamPacket packet;
                 packet.payload = std::move(opus);
-                packet.timestamp = last_output_timestamp_;
-                last_output_timestamp_ = 0;
-                Schedule([this, packet = std::move(packet)]() {
+                uint32_t last_output_timestamp_value = last_output_timestamp_.load();
+                {
+                    std::lock_guard<std::mutex> lock(timestamp_mutex_);
+                    if (!timestamp_queue_.empty()) {
+                        packet.timestamp = timestamp_queue_.front();
+                        timestamp_queue_.pop_front();
+                    } else {
+                        packet.timestamp = 0;
+                    }
+
+                    if (timestamp_queue_.size() > 3) { // 限制队列长度3
+                        timestamp_queue_.pop_front(); // 该包发送前先出队保持队列长度
+                        return;
+                    }
+                }
+                Schedule([this, last_output_timestamp_value, packet = std::move(packet)]() {
                     protocol_->SendAudio(packet);
+                    // ESP_LOGI(TAG, "Send %zu bytes, timestamp %lu, last_ts %lu, qsize %zu",
+                    //     packet.payload.size(), packet.timestamp, last_output_timestamp_value, timestamp_queue_.size());
                 });
             });
         });
@@ -709,7 +732,11 @@ void Application::OnAudioOutput() {
             pcm = std::move(resampled);
         }
         codec->OutputData(pcm);
-        last_output_timestamp_ = packet.timestamp;
+        {
+            std::lock_guard<std::mutex> lock(timestamp_mutex_);
+            timestamp_queue_.push_back(packet.timestamp);
+            last_output_timestamp_ = packet.timestamp;
+        }
         last_output_time_ = std::chrono::steady_clock::now();
     });
 }
@@ -808,6 +835,7 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
             audio_processor_->Stop();
+            
 #if CONFIG_USE_WAKE_WORD_DETECT
             wake_word_detect_.StartDetection();
 #endif
@@ -816,11 +844,12 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
+            timestamp_queue_.clear();
+            last_output_timestamp_ = 0;
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
-
             // Update the IoT states before sending the start listening command
             UpdateIotStates();
 
@@ -862,7 +891,6 @@ void Application::ResetDecoder() {
     audio_decode_queue_.clear();
     audio_decode_cv_.notify_all();
     last_output_time_ = std::chrono::steady_clock::now();
-    
     auto codec = Board::GetInstance().GetAudioCodec();
     codec->EnableOutput(true);
 }
